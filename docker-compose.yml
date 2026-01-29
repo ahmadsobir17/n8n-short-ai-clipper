@@ -41,14 +41,14 @@ services:
       retries: 5
 
   n8n-prod:
-    image: n8nio/n8n:latest
+    build: .
+    # image: n8nio/n8n:latest
     container_name: n8n-prod
     restart: always
     environment:
       N8N_CORS_ORIGIN: http://localhost:3000,https://axiamasi.com
       EXECUTIONS_DATA_PRUNE: true
-      EXECUTIONS_DATA_MAX_AGE: 48
-      EXECUTIONS_DATA_PRUNE_MAX_COUNT: 1000
+      EXECUTIONS_DATA_PRUNE_MAX_COUNT: 200
       N8N_LOG_LEVEL: error
       DB_TYPE: postgresdb
       DB_POSTGRESDB_HOST: postgres-prod
@@ -61,20 +61,30 @@ services:
       N8N_REDIS_PASSWORD: ${REDIS_PASSWORD}
       N8N_ENCRYPTION_KEY: ${N8N_ENCRYPTION_KEY}
       GENERIC_TIMEZONE: ${GENERIC_TIMEZONE}
-      N8N_HOST: n8nprod.axiamasi.com
+      N8N_HOST: ${DOMAIN_NAME:-localhost}
       N8N_PORT: 5678
       N8N_PROTOCOL: https
-      WEBHOOK_URL: https://n8nprod.axiamasi.com
+      WEBHOOK_URL: https://${DOMAIN_NAME:-localhost}
       N8N_BASIC_AUTH_ACTIVE: ${N8N_BASIC_AUTH_ACTIVE}
       N8N_BASIC_AUTH_USER: ${N8N_BASIC_AUTH_USER}
       N8N_BASIC_AUTH_PASSWORD: ${N8N_BASIC_AUTH_PASSWORD}
       N8N_TRUSTED_PROXIES: ${N8N_TRUSTED_PROXIES}
-      N8N_CONCURRENCY_PRODUCTION_LIMIT: 5
-      NODE_OPTIONS: --max-old-space-size=450
+      N8N_CONCURRENCY_PRODUCTION_LIMIT: 2
+      NODE_OPTIONS: --max-old-space-size=512
       N8N_PROXY_HOPS: 1
       NODE_ENV: production
+      N8N_BLOCK_FS_WRITE_ACCESS: "false"
+      N8N_RESTRICT_FILE_ACCESS_TO: "/root/.n8n-files;/tmp/clipper;/data/output"
+      NODES_EXCLUDE: "[]"
+      N8N_TRUST_PROXY: "true"
+      EXECUTIONS_DATA_MAX_AGE: 168
     volumes:
-      - ./n8n_data:/home/node/.n8n
+      - ./n8n_data:/root/.n8n
+      - ./scripts:/app/scripts
+      - /opt/n8n-clipper/output:/data/output
+      - /opt/n8n-clipper/tmp:/tmp/clipper
+      - /opt/n8n-clipper/cookies:/cookies
+    user: "root"
     ports:
       - "5679:5678"
     depends_on:
@@ -87,7 +97,7 @@ services:
     deploy:
       resources:
         limits:
-          memory: 512M
+          memory: 1G
 
   gowa:
     image: aldinokemal2104/go-whatsapp-web-multidevice
@@ -116,11 +126,11 @@ services:
     image: cloudflare/cloudflared:latest
     container_name: cloudflared
     restart: always
-    command: tunnel --no-autoupdate run
+    command: tunnel --no-autoupdate run --protocol http2
     environment:
       - TUNNEL_TOKEN=${CLOUDFLARE_TUNNEL_TOKEN_PROD}
     networks:
-      - production  # Pake satu network aja
+      - production # Pake satu network aja
     deploy:
       resources:
         limits:
