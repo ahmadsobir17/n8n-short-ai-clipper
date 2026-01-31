@@ -100,6 +100,8 @@ def analyze_video(video_path, start_time, duration):
                 segments.append({'start': start_t, 'end': frame_data[i]['timestamp'], 'mode': curr_mode})
                 start_t, curr_mode = frame_data[i]['timestamp'], frame_data[i]['mode']
         segments.append({'start': start_t, 'end': duration, 'mode': curr_mode})
+    if not segments:
+        segments.append({'start': 0, 'end': duration, 'mode': 'closeup', 'avg_x': 0.5})
     for seg in segments:
         seg_frames = [f for f in frame_data if seg['start'] <= f['timestamp'] <= seg['end']]
         seg['avg_x'] = sum(f['primary_x'] for f in seg_frames) / len(seg_frames) if seg_frames else 0.5
@@ -135,27 +137,39 @@ def analyze_audio_emphasis(video_path, start_time, duration):
         if os.path.exists(temp_wav.name): os.unlink(temp_wav.name)
 
 def generate_crop_filter(analysis, duration, words, emphasis):
+    """Generate FFmpeg filter_complex for video cropping, zooming, and audio mixing."""
     w, h = analysis['video_width'], analysis['video_height']
     segments = analysis['segments']
     out_w, out_h, panel_h = 1080, 1920, 960
     aspect_9_16, aspect_panel = 9/16, 1080/960
     fade_duration = 0.3 if len(segments) > 1 else 0
     filter_parts, v_names, a_names = [], [], []
+    
+    # Pre-calculate cumulative times for transitions
+    seg_durations = [seg['end'] - seg['start'] for seg in segments]
+    cum_times = [0.0]
+    for i in range(len(segments) - 1):
+        cum_times.append(cum_times[-1] + seg_durations[i] - fade_duration)
+    
     for i, seg in enumerate(segments):
         start, end, mode = seg['start'], seg['end'], seg['mode']
         v_seg, a_seg = f"v{i}", f"a{i}"
-        trim_v, trim_a = f"trim=start={start}:end={end},setpts=PTS-STARTPTS", f"atrim=start={start}:end={end},asetpts=PTS-STARTPTS"
+        seg_dur = end - start
+        # Video and audio trimming relative to the ALREADY SEEKED input (starts at 0)
+        trim_v = f"fps=24,trim=start={start}:end={end},setpts=PTS-STARTPTS"
+        trim_a = f"aresample=async=1,atrim=start={start}:end={end},asetpts=PTS-STARTPTS"
         
         # Build zoom expression (Punch Zoom + Snap Hook Zoom)
         z_expr = "1.0"
         # Hook Snap Zoom: 25% zoom for 1.5s at the very beginning of the clip
         z_expr += "+0.25*between(time,0,1.5)*sin(PI*time/1.5)"
         
+        # Emphasis Zoom
         for emp in emphasis:
-             es, ee = emp['start'] - start, emp['end'] - start
-             if ee > 0 and es < (end - start):
-                 d = max(0.01, min(end-start, ee) - max(0, es))
-                 z_expr += f"+0.15*between(time,{max(0, es):.3f},{min(end-start, ee):.3f})*sin(PI*(time-{max(0,es):.3f})/{d:.3f})"
+            es, ee = emp['start'] - start, emp['end'] - start
+            if ee > 0 and es < seg_dur:
+                d = max(0.01, min(end-start, ee) - max(0, es))
+                z_expr += f"+0.15*between(time,{max(0, es):.3f},{min(end-start, ee):.3f})*sin(PI*(time-{max(0,es):.3f})/{d:.3f})"
         
         zoom_filter = f"zoompan=z='{z_expr}':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=1:s={out_w}x{out_h}:fps=24"
         zoom_filter_panel = f"zoompan=z='{z_expr}':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d=1:s={out_w}x{panel_h}:fps=24"
@@ -174,23 +188,66 @@ def generate_crop_filter(analysis, duration, words, emphasis):
             part = f"[0:v]{trim_v},crop={cw}:{ch}:{xb}:0,scale={out_w}:{out_h},setsar=1,fps=24,format=yuv420p,{zoom_filter}[{v_seg}];[0:a]{trim_a}[{a_seg}]"
         filter_parts.append(part)
         v_names.append(f"[{v_seg}]"); a_names.append(f"[{a_seg}]")
-    cv, ca, cum_t, chains = v_names[0], a_names[0], segments[0]['end']-segments[0]['start'], []
+    
+    if not segments or not v_names:
+        return f"[0:v]scale={out_w}:{out_h},setsar=1,fps=24,format=yuv420p[stacked];[0:a]acopy[stackeda]", "[stackeda]"
+
+    # Build video and audio chains
+    f_str = ";".join(filter_parts)
+    
+    if len(segments) == 1:
+        # Single segment: just rename
+        f_str = f_str.replace("[v0]", "[stacked]").replace("[a0]", "[main_audio]")
+    else:
+        # Multiple segments: crossfade
+        cv, ca, cum_t, chains = v_names[0], a_names[0], segments[0]['end']-segments[0]['start'], []
+        for i in range(1, len(segments)):
+            vo, ao = (f"[vx{i}]", f"[ax{i}]") if i < len(segments)-1 else ("[stacked]", "[main_audio]")
+            off = max(0, cum_t - fade_duration)
+            chains.append(f"{cv}{v_names[i]}xfade=transition=dissolve:duration={fade_duration}:offset={off:.3f}{vo}")
+            chains.append(f"{ca}{a_names[i]}acrossfade=duration={fade_duration}{ao}")
+            cum_t = off + (segments[i]['end']-segments[i]['start'])
+            cv, ca = vo, ao
+        f_str += ";" + ";".join(chains)
+
+    # ====== SFX CHAINS (LOUD!) ======
+    sfx_chains = []
+    sfx_nodes = []
+    
+    # 1. HOOK SOUND: Vine Boom at start (VERY LOUD)
+    sfx_chains.append(f"[4:a]atrim=0:1.5,volume=3.0[hook_boom]")
+    sfx_nodes.append("hook_boom")
+    
+    # 2. HOOK WHOOSH at start
+    sfx_chains.append(f"[1:a]atrim=0:0.5,volume=2.5[hook_whoosh]")
+    sfx_nodes.append("hook_whoosh")
+    
+    # 3. TRANSITION WHOOSH for each segment change
     for i in range(1, len(segments)):
-        vo, ao = (f"[vx{i}]", f"[ax{i}]") if i < len(segments)-1 else ("[stacked]", "[stackeda]")
-        off = max(0, cum_t - fade_duration)
-        chains.append(f"{cv}{v_names[i]}xfade=transition=dissolve:duration={fade_duration}:offset={off:.3f}{vo}")
-        chains.append(f"{ca}{a_names[i]}acrossfade=duration={fade_duration}{ao}")
-        cum_t = off + (segments[i]['end']-segments[i]['start'])
-        cv, ca = vo, ao
-    if len(segments) > 1:
-        f_str = ";".join(filter_parts) + ";" + ";".join(chains)
-        ts, cur = 0, 0
-        for wd in words:
-            while cur < len(segments)-1 and wd['start'] > segments[cur]['end']:
-                cur += 1; ts += fade_duration
-            wd['start'] = max(0, wd['start'] - ts); wd['end'] = max(wd['start'] + 0.1, wd['end'] - ts)
-        return f_str, "[stackeda]"
-    return filter_parts[0].replace(v_names[0], "[stacked]").replace(a_names[0], "[stackeda]"), "[stackeda]"
+        t_ms = int(cum_times[i] * 1000)
+        sfx_chains.append(f"[1:a]atrim=0:0.5,volume=2.0,adelay={t_ms}|{t_ms}[trans_whoosh{i}]")
+        sfx_nodes.append(f"trans_whoosh{i}")
+    
+    # Background Music (subtle)
+    f_str += f";[3:a]aloop=loop=-1:size=2e+09,atrim=0:{duration},volume=0.08[bgm_loop]"
+    f_str += f";[main_audio][bgm_loop]amix=inputs=2:duration=first:weights=1 0.2[with_bgm]"
+    
+    # Add all SFX chains
+    f_str += ";" + ";".join(sfx_chains)
+    
+    # Final mix: with_bgm + all SFX nodes
+    all_sfx = "".join([f"[{n}]" for n in sfx_nodes])
+    f_str += f";[with_bgm]{all_sfx}amix=inputs={len(sfx_nodes)+1}:duration=first[stackeda]"
+
+    # Adjust subtitle timestamps for crossfade shifts
+    ts, cur = 0, 0
+    for wd in words:
+        while cur < len(segments)-1 and wd['start'] > segments[cur]['end']:
+            cur += 1; ts += fade_duration
+        wd['start'] = max(0, wd['start'] - ts); wd['end'] = max(wd['start'] + 0.1, wd['end'] - ts)
+    
+    return f_str, "[stackeda]"
+
 
 def transcribe_audio(video_path, start_time, duration):
     print("  Transcribing audio with Whisper (medium)...")
@@ -204,7 +261,11 @@ def transcribe_audio(video_path, start_time, duration):
         for s in res.get('segments', []):
             for w in s.get('words', []): words.append({'word': w['word'].strip(), 'start': w['start'], 'end': w['end']})
         return words
-    finally: os.unlink(temp.name)
+    finally:
+        if 'model' in locals():
+            del model
+        gc.collect()
+        os.unlink(temp.name)
 
 def format_ass_time(s): return f"{int(s//3600)}:{int((s%3600)//60):02d}:{int(s%60):02d}.{int((s%1)*100):02d}"
 
@@ -240,6 +301,21 @@ def generate_ass_subtitle(words, analysis, title=None):
 
 def process_video(input_file, output_file, start_time, duration, ass_file=None, hook_title=None):
     print(f"  Starting video processing for {output_file}...")
+    
+    assets_dir = Path(__file__).parent / "assets"
+    whoosh_sfx = assets_dir / "whoosh.mp3"
+    pop_sfx = assets_dir / "pop.mp3"
+    bg_music = assets_dir / "bg_music.mp3"
+    vine_boom = assets_dir / "vine_boom.mp3"
+    ding_sfx = assets_dir / "ding.mp3"
+    
+    # Fallback to silent audio if assets are missing
+    extra_inputs = []
+    # Index mapping: 1=whoosh, 2=pop, 3=bg, 4=vine, 5=ding
+    for asset in [whoosh_sfx, pop_sfx, bg_music, vine_boom, ding_sfx]:
+        if asset.exists(): extra_inputs.extend(["-i", str(asset)])
+        else: extra_inputs.extend(["-f", "lavfi", "-i", "anullsrc=r=44100:cl=stereo:d=5"])
+    
     analysis = analyze_video(input_file, start_time, duration)
     if not analysis:
         print("  Error: Video analysis failed."); return
@@ -247,6 +323,10 @@ def process_video(input_file, output_file, start_time, duration, ass_file=None, 
     words = transcribe_audio(input_file, actual_start, duration)
     emphasis = analyze_audio_emphasis(input_file, actual_start, duration)
     f_complex, a_stream = generate_crop_filter(analysis, duration, words, emphasis)
+    
+    # Critical Memory Cleanup
+    del emphasis
+    gc.collect()
     if ass_file and words:
         with open(ass_file, 'w') as f: f.write(generate_ass_subtitle(words, analysis, title=hook_title))
         if os.path.exists(ass_file) and os.path.getsize(ass_file) > 0:
@@ -255,8 +335,23 @@ def process_video(input_file, output_file, start_time, duration, ass_file=None, 
         else: v_stream = "[stacked]"
     else: v_stream = "[stacked]"
     
+    del analysis
+    gc.collect()
+    
     print("  Executing FFmpeg...")
-    cmd = ['ffmpeg', '-y', '-ss', str(actual_start), '-t', str(duration), '-i', input_file, '-filter_complex', f_complex, '-map', v_stream, '-map', a_stream, '-c:v', 'libx264', '-preset', 'fast', '-crf', '23', '-c:a', 'aac', '-b:a', '128k', '-movflags', '+faststart', output_file]
+    # IMPORTANT: -ss and -t BEFORE -i for fast seek, applied to main video ONLY
+    # SFX inputs are added WITHOUT seek so they start at 0
+    cmd = ['ffmpeg', '-y']
+    cmd.extend(['-ss', str(actual_start), '-t', str(duration), '-i', input_file])
+    cmd.extend(extra_inputs)
+    cmd.extend([
+        '-filter_complex', f_complex,
+        '-map', v_stream, '-map', a_stream,
+        '-c:v', 'libx264', '-preset', 'fast', '-crf', '23',
+        '-c:a', 'aac', '-b:a', '128k',
+        '-movflags', '+faststart', output_file
+    ])
+    
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
         print(f"  FFmpeg failed with exit code {result.returncode}\n  FFmpeg Error: {result.stderr}")

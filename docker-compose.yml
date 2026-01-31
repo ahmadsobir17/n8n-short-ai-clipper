@@ -11,10 +11,7 @@ services:
       - ./postgres_data:/var/lib/postgresql/data
     networks:
       - production
-    deploy:
-      resources:
-        limits:
-          memory: 256M
+
     healthcheck:
       test: [ "CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}" ]
       interval: 10s
@@ -30,10 +27,6 @@ services:
       - ./redis_data:/data
     networks:
       - production
-    deploy:
-      resources:
-        limits:
-          memory: 128M
     healthcheck:
       test: [ "CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "ping" ]
       interval: 10s
@@ -69,7 +62,7 @@ services:
       N8N_BASIC_AUTH_USER: ${N8N_BASIC_AUTH_USER}
       N8N_BASIC_AUTH_PASSWORD: ${N8N_BASIC_AUTH_PASSWORD}
       N8N_TRUSTED_PROXIES: ${N8N_TRUSTED_PROXIES}
-      N8N_CONCURRENCY_PRODUCTION_LIMIT: 2
+      N8N_CONCURRENCY_PRODUCTION_LIMIT: 3
       NODE_OPTIONS: --max-old-space-size=512
       N8N_PROXY_HOPS: 1
       NODE_ENV: production
@@ -100,10 +93,6 @@ services:
       start_period: 30s
     networks:
       - production
-    deploy:
-      resources:
-        limits:
-          memory: 4G
 
   cloudflared:
     image: cloudflare/cloudflared:latest
@@ -117,11 +106,6 @@ services:
         condition: service_healthy
     networks:
       - production # Pake satu network aja
-    deploy:
-      resources:
-        limits:
-          memory: 128M
-
 networks:
   production:
     driver: bridge
